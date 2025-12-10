@@ -80,6 +80,8 @@ func main() {
 	{
 		routes.AuthRoutes(api)
 		routes.UserRoutes(api)
+		routes.AchievementRoutes(api)
+		routes.StudentRoutes(api)
 	}
 
 	// 9. Health check
