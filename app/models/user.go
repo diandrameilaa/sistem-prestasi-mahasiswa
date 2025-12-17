@@ -4,23 +4,61 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"gorm.io/gorm"
 )
 
 type User struct {
-	ID           uuid.UUID `gorm:"type:uuid;primary_key;default:gen_random_uuid()"`
-	Username     string    `gorm:"type:varchar(50);unique;not null"`
-	Email        string    `gorm:"type:varchar(100);unique;not null"`
-	PasswordHash string    `gorm:"type:varchar(255);not null"`
-	FullName     string    `gorm:"type:varchar(100);not null"`
-	RoleID       uuid.UUID `gorm:"type:uuid;not null"`
-	Role         Role      `gorm:"foreignKey:RoleID"`
-	IsActive     bool      `gorm:"default:true"`
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	ID           uuid.UUID `json:"id"`
+	Username     string    `json:"username"`
+	Email        string    `json:"email"`
+	PasswordHash string    `json:"-"`
+	FullName     string    `json:"full_name"`
+	RoleID       uuid.UUID `json:"role_id"`
+	Role         *Role     `json:"role,omitempty"`
+	IsActive     bool      `json:"is_active"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
 }
 
-func (u *User) BeforeCreate(tx *gorm.DB) (err error) {
-	u.ID = uuid.New()
-	return
+type Role struct {
+	ID          uuid.UUID       `json:"id"`
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	Permissions []*Permission   `json:"permissions,omitempty"`
+	CreatedAt   time.Time       `json:"created_at"`
+}
+
+type Permission struct {
+	ID          uuid.UUID `json:"id"`
+	Name        string    `json:"name"`
+	Resource    string    `json:"resource"`
+	Action      string    `json:"action"`
+	Description string    `json:"description"`
+}
+
+type LoginRequest struct {
+	Username string `json:"username" validate:"required"`
+	Password string `json:"password" validate:"required"`
+}
+
+type LoginResponse struct {
+	Status       string `json:"status"`
+	Token        string `json:"token"`
+	RefreshToken string `json:"refresh_token"`
+	User         *UserResponse `json:"user"`
+}
+
+type UserResponse struct {
+	ID          uuid.UUID  `json:"id"`
+	Username    string     `json:"username"`
+	FullName    string     `json:"full_name"`
+	Role        string     `json:"role"`
+	Permissions []string   `json:"permissions"`
+}
+
+type CreateUserRequest struct {
+	Username string    `json:"username" validate:"required"`
+	Email    string    `json:"email" validate:"required,email"`
+	Password string    `json:"password" validate:"required,min=8"`
+	FullName string    `json:"full_name" validate:"required"`
+	RoleID   uuid.UUID `json:"role_id" validate:"required"`
 }

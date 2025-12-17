@@ -1,414 +1,257 @@
 package routes
 
 import (
-	"sistem-prestasi-mhs/app/helper"
+	"database/sql"
+
+	"github.com/gofiber/fiber/v2"
+	"go.mongodb.org/mongo-driver/mongo"
+
+	"sistem-prestasi-mhs/app/helpers"
 	"sistem-prestasi-mhs/app/middleware"
 	"sistem-prestasi-mhs/app/models"
 	"sistem-prestasi-mhs/app/repository"
 	"sistem-prestasi-mhs/app/service"
-
-	"github.com/gofiber/fiber/v2"
-	"github.com/google/uuid"
 )
 
-func AchievementRoutes(r fiber.Router) {
-	achievementRepo := repository.NewAchievementRepository()
-	studentRepo := repository.NewStudentRepository()
-	achievementService := service.NewAchievementService(achievementRepo, studentRepo)
+type AchievementHandler struct {
+	service     *service.AchievementService
+	studentRepo *repository.StudentRepository
+}
 
-	achievements := r.Group("/achievements")
+func NewAchievementHandler(s *service.AchievementService, sr *repository.StudentRepository) *AchievementHandler {
+	return &AchievementHandler{service: s, studentRepo: sr}
+}
 
-	// Pastikan middleware.AuthMiddleware() sudah disesuaikan untuk Fiber
-	achievements.Use(middleware.AuthMiddleware())
+func SetupAchievementRoutes(router fiber.Router, db *sql.DB, mongoDB *mongo.Database) {
+	userRepo := repository.NewUserRepository(db)
+	studentRepo := repository.NewStudentRepository(db)
+	achRepo := repository.NewAchievementRepository(db, mongoDB)
 
-	{
-		// @Summary Get Achievements List
-		// @Description Get list of achievements based on user role
-		// @Tags Achievements
-		// @Produce json
-		// @Security BearerAuth
-		// @Param page query int false "Page number" default(1)
-		// @Param limit query int false "Items per page" default(10)
-		// @Param status query string false "Filter by status"
-		// @Success 200 {object} object{status=string,data=object{items=array,total=int,page=int,limit=int}}
-		// @Failure 401 {object} object{status=string,message=string}
-		// @Router /achievements [get]
-		achievements.Get("/", func(c *fiber.Ctx) error {
-			// Mengambil data dari Locals (Middleware) dan melakukan Type Assertion ke string
-			userIDStr, _ := c.Locals("user_id").(string)
-			userID := helper.ParseUUID(userIDStr)
-			role, _ := c.Locals("role").(string)
+	authService := service.NewAuthService(userRepo)
+	achService := service.NewAchievementService(achRepo, studentRepo, userRepo)
 
-			// Fiber QueryInt memudahkan parsing pagination
-			page := c.QueryInt("page", 1)
-			limit := c.QueryInt("limit", 10)
-			status := c.Query("status")
+	handler := NewAchievementHandler(achService, studentRepo)
 
-			offset := (page - 1) * limit
+	router.Use(middleware.AuthMiddleware(authService))
 
-			var items []map[string]interface{}
-			var total int64
-			var err error
+	router.Get("/", handler.List)
+	router.Get("/:id", handler.GetDetail)
+	router.Post("/", handler.Create)
+	router.Delete("/:id", handler.Delete)
+	router.Post("/:id/submit", handler.Submit)
 
-			switch role {
-			case "Mahasiswa":
-				// Get student record
-				student, err := studentRepo.FindByUserID(userID)
-				if err != nil {
-					return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
-						"status":  "error",
-						"message": "Student record not found",
-					})
-				}
-				items, total, err = achievementService.GetStudentAchievements(student.ID, limit, offset)
+	adminGroup := router.Group("/:id", middleware.RequireRole(userRepo, "lecturer", "admin"))
+	adminGroup.Post("/verify", handler.Verify)
+	adminGroup.Post("/reject", handler.Reject)
+}
 
-			case "Dosen Wali":
-				// Get lecturer record
-				lecturer, err := studentRepo.FindLecturerByUserID(userID)
-				if err != nil {
-					return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
-						"status":  "error",
-						"message": "Lecturer record not found",
-					})
-				}
-				items, total, err = achievementService.GetAdvisorAchievements(lecturer.ID, limit, offset)
+// List godoc
+// @Summary List all achievements
+// @Description Get paginated list of achievements
+// @Tags Achievements
+// @Accept json
+// @Produce json
+// @Security BearerAuth
+// @Param limit query int false "Limit" default(10)
+// @Param offset query int false "Offset" default(0)
+// @Success 200 {object} map[string]interface{} "List of achievements"
+// @Failure 500 {object} map[string]interface{} "Internal server error"
+// @Router /achievements [get]
+func (h *AchievementHandler) List(c *fiber.Ctx) error {
+	limit, offset := helpers.GetPaginationParams(c)
 
-			case "Admin":
-				items, total, err = achievementService.GetAllAchievements(limit, offset, status)
-
-			default:
-				return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
-					"status":  "error",
-					"message": "Unauthorized role",
-				})
-			}
-
-			if err != nil {
-				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-					"status":  "error",
-					"message": err.Error(),
-				})
-			}
-
-			return c.Status(fiber.StatusOK).JSON(fiber.Map{
-				"status": "success",
-				"data": fiber.Map{
-					"items": items,
-					"total": total,
-					"page":  page,
-					"limit": limit,
-				},
-			})
-		})
-
-		// @Summary Create Achievement
-		// @Description Create new achievement (Mahasiswa only)
-		// @Tags Achievements
-		// @Accept json
-		// @Produce json
-		// @Security BearerAuth
-		// @Param achievement body models.Achievement true "Achievement data"
-		// @Success 201 {object} object{status=string,data=object}
-		// @Failure 400 {object} object{status=string,message=string}
-		// @Router /achievements [post]
-		achievements.Post("/", middleware.RequirePermission("achievement:create"), func(c *fiber.Ctx) error {
-			userIDStr, _ := c.Locals("user_id").(string)
-			userID := helper.ParseUUID(userIDStr)
-
-			// Get student record
-			student, err := studentRepo.FindByUserID(userID)
-			if err != nil {
-				return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
-					"status":  "error",
-					"message": "Student record not found",
-				})
-			}
-
-			var achievement models.Achievement
-			if err := c.BodyParser(&achievement); err != nil {
-				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-					"status":  "error",
-					"message": err.Error(),
-				})
-			}
-
-			ref, err := achievementService.CreateAchievement(student.ID, &achievement)
-			if err != nil {
-				return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-					"status":  "error",
-					"message": err.Error(),
-				})
-			}
-
-			return c.Status(fiber.StatusCreated).JSON(fiber.Map{
-				"status": "success",
-				"data": fiber.Map{
-					"id":                   ref.ID,
-					"mongo_achievement_id": ref.MongoAchievementID,
-					"status":               ref.Status,
-					"achievement":          achievement,
-				},
-			})
-		})
-
-		// @Summary Get Achievement Detail
-		// @Description Get achievement detail by ID
-		// @Tags Achievements
-		// @Produce json
-		// @Security BearerAuth
-		// @Param id path string true "Achievement ID"
-		// @Success 200 {object} object{status=string,data=object}
-		// @Failure 404 {object} object{status=string,message=string}
-		// @Router /achievements/{id} [get]
-		achievements.Get("/:id", func(c *fiber.Ctx) error {
-			id, err := uuid.Parse(c.Params("id"))
-			if err != nil {
-				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-					"status":  "error",
-					"message": "Invalid ID format",
-				})
-			}
-
-			achievement, ref, err := achievementService.GetAchievementByID(id)
-			if err != nil {
-				return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
-					"status":  "error",
-					"message": "Achievement not found",
-				})
-			}
-
-			return c.Status(fiber.StatusOK).JSON(fiber.Map{
-				"status": "success",
-				"data": fiber.Map{
-					"reference":   ref,
-					"achievement": achievement,
-				},
-			})
-		})
-
-		// @Summary Update Achievement
-		// @Description Update achievement (Mahasiswa only, draft status only)
-		// @Tags Achievements
-		// @Accept json
-		// @Produce json
-		// @Security BearerAuth
-		// @Param id path string true "Achievement ID"
-		// @Param achievement body models.Achievement true "Achievement data"
-		// @Success 200 {object} object{status=string,message=string}
-		// @Failure 400 {object} object{status=string,message=string}
-		// @Router /achievements/{id} [put]
-		achievements.Put("/:id", middleware.RequirePermission("achievement:update"), func(c *fiber.Ctx) error {
-			id, err := uuid.Parse(c.Params("id"))
-			if err != nil {
-				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-					"status":  "error",
-					"message": "Invalid ID format",
-				})
-			}
-
-			userIDStr, _ := c.Locals("user_id").(string)
-			userID := helper.ParseUUID(userIDStr)
-
-			student, err := studentRepo.FindByUserID(userID)
-			if err != nil {
-				return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
-					"status":  "error",
-					"message": "Student record not found",
-				})
-			}
-
-			var achievement models.Achievement
-			if err := c.BodyParser(&achievement); err != nil {
-				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-					"status":  "error",
-					"message": err.Error(),
-				})
-			}
-
-			if err := achievementService.UpdateAchievement(id, student.ID, &achievement); err != nil {
-				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-					"status":  "error",
-					"message": err.Error(),
-				})
-			}
-
-			return c.Status(fiber.StatusOK).JSON(fiber.Map{
-				"status":  "success",
-				"message": "Achievement updated successfully",
-			})
-		})
-
-		// @Summary Delete Achievement
-		// @Description Soft delete achievement (Mahasiswa only, draft status only)
-		// @Tags Achievements
-		// @Produce json
-		// @Security BearerAuth
-		// @Param id path string true "Achievement ID"
-		// @Success 200 {object} object{status=string,message=string}
-		// @Failure 400 {object} object{status=string,message=string}
-		// @Router /achievements/{id} [delete]
-		achievements.Delete("/:id", middleware.RequirePermission("achievement:delete"), func(c *fiber.Ctx) error {
-			id, err := uuid.Parse(c.Params("id"))
-			if err != nil {
-				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-					"status":  "error",
-					"message": "Invalid ID format",
-				})
-			}
-
-			userIDStr, _ := c.Locals("user_id").(string)
-			userID := helper.ParseUUID(userIDStr)
-
-			student, err := studentRepo.FindByUserID(userID)
-			if err != nil {
-				return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
-					"status":  "error",
-					"message": "Student record not found",
-				})
-			}
-
-			if err := achievementService.DeleteAchievement(id, student.ID); err != nil {
-				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-					"status":  "error",
-					"message": err.Error(),
-				})
-			}
-
-			return c.Status(fiber.StatusOK).JSON(fiber.Map{
-				"status":  "success",
-				"message": "Achievement deleted successfully",
-			})
-		})
-
-		// @Summary Submit Achievement for Verification
-		// @Description Submit draft achievement for verification by advisor
-		// @Tags Achievements
-		// @Produce json
-		// @Security BearerAuth
-		// @Param id path string true "Achievement ID"
-		// @Success 200 {object} object{status=string,message=string}
-		// @Failure 400 {object} object{status=string,message=string}
-		// @Router /achievements/{id}/submit [post]
-		achievements.Post("/:id/submit", middleware.RequirePermission("achievement:create"), func(c *fiber.Ctx) error {
-			id, err := uuid.Parse(c.Params("id"))
-			if err != nil {
-				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-					"status":  "error",
-					"message": "Invalid ID format",
-				})
-			}
-
-			userIDStr, _ := c.Locals("user_id").(string)
-			userID := helper.ParseUUID(userIDStr)
-
-			student, err := studentRepo.FindByUserID(userID)
-			if err != nil {
-				return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
-					"status":  "error",
-					"message": "Student record not found",
-				})
-			}
-
-			if err := achievementService.SubmitForVerification(id, student.ID); err != nil {
-				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-					"status":  "error",
-					"message": err.Error(),
-				})
-			}
-
-			return c.Status(fiber.StatusOK).JSON(fiber.Map{
-				"status":  "success",
-				"message": "Achievement submitted for verification",
-			})
-		})
-
-		// @Summary Verify Achievement
-		// @Description Verify submitted achievement (Dosen Wali only)
-		// @Tags Achievements
-		// @Produce json
-		// @Security BearerAuth
-		// @Param id path string true "Achievement ID"
-		// @Success 200 {object} object{status=string,message=string}
-		// @Failure 400 {object} object{status=string,message=string}
-		// @Router /achievements/{id}/verify [post]
-		achievements.Post("/:id/verify", middleware.RequirePermission("achievement:verify"), func(c *fiber.Ctx) error {
-			id, err := uuid.Parse(c.Params("id"))
-			if err != nil {
-				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-					"status":  "error",
-					"message": "Invalid ID format",
-				})
-			}
-
-			userIDStr, _ := c.Locals("user_id").(string)
-			userID := helper.ParseUUID(userIDStr)
-
-			if err := achievementService.VerifyAchievement(id, userID); err != nil {
-				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-					"status":  "error",
-					"message": err.Error(),
-				})
-			}
-
-			return c.Status(fiber.StatusOK).JSON(fiber.Map{
-				"status":  "success",
-				"message": "Achievement verified successfully",
-			})
-		})
-
-		// @Summary Reject Achievement
-		// @Description Reject submitted achievement with note (Dosen Wali only)
-		// @Tags Achievements
-		// @Accept json
-		// @Produce json
-		// @Security BearerAuth
-		// @Param id path string true "Achievement ID"
-		// @Param request body object{rejection_note=string} true "Rejection note"
-		// @Success 200 {object} object{status=string,message=string}
-		// @Failure 400 {object} object{status=string,message=string}
-		// @Router /achievements/{id}/reject [post]
-		achievements.Post("/:id/reject", middleware.RequirePermission("achievement:verify"), func(c *fiber.Ctx) error {
-			id, err := uuid.Parse(c.Params("id"))
-			if err != nil {
-				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-					"status":  "error",
-					"message": "Invalid ID format",
-				})
-			}
-
-			var req struct {
-				RejectionNote string `json:"rejection_note"`
-			}
-
-			if err := c.BodyParser(&req); err != nil {
-				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-					"status":  "error",
-					"message": err.Error(),
-				})
-			}
-
-			// Validasi manual karena Fiber BodyParser tidak support tag binding otomatis
-			if req.RejectionNote == "" {
-				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-					"status":  "error",
-					"message": "rejection_note is required",
-				})
-			}
-
-			userIDStr, _ := c.Locals("user_id").(string)
-			userID := helper.ParseUUID(userIDStr)
-
-			if err := achievementService.RejectAchievement(id, userID, req.RejectionNote); err != nil {
-				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-					"status":  "error",
-					"message": err.Error(),
-				})
-			}
-
-			return c.Status(fiber.StatusOK).JSON(fiber.Map{
-				"status":  "success",
-				"message": "Achievement rejected",
-			})
-		})
+	data, err := h.service.ListAchievements(c.Context(), limit, offset)
+	if err != nil {
+		return helpers.ErrorResponse(c, fiber.StatusInternalServerError, "failed to fetch data", err.Error())
 	}
+
+	return helpers.ListResponse(c, data, len(data), limit, offset)
+}
+
+// GetDetail godoc
+// @Summary Get achievement detail
+// @Description Get detailed information about a specific achievement
+// @Tags Achievements
+// @Accept json
+// @Produce json
+// @Security BearerAuth
+// @Param id path string true "Achievement ID (UUID)"
+// @Success 200 {object} map[string]interface{} "Achievement details"
+// @Failure 404 {object} map[string]interface{} "Achievement not found"
+// @Router /achievements/{id} [get]
+func (h *AchievementHandler) GetDetail(c *fiber.Ctx) error {
+	id, err := helpers.GetUUIDFromParams(c, "id")
+	if err != nil {
+		return helpers.ErrInvalidRequest
+	}
+
+	data, err := h.service.GetAchievementDetail(c.Context(), id)
+	if err != nil {
+		return helpers.ErrorResponse(c, fiber.StatusNotFound, "achievement not found", err.Error())
+	}
+
+	return helpers.SuccessResponse(c, fiber.StatusOK, "achievement retrieved", data)
+}
+
+// Create godoc
+// @Summary Create new achievement
+// @Description Students can create a new achievement entry
+// @Tags Achievements
+// @Accept json
+// @Produce json
+// @Security BearerAuth
+// @Param achievement body models.CreateAchievementRequest true "Achievement data"
+// @Success 201 {object} map[string]interface{} "Achievement created"
+// @Failure 400 {object} map[string]interface{} "Bad request"
+// @Failure 403 {object} map[string]interface{} "Forbidden - only students can create"
+// @Router /achievements [post]
+func (h *AchievementHandler) Create(c *fiber.Ctx) error {
+	userID, err := helpers.GetUserIDFromLocals(c)
+	if err != nil {
+		return helpers.ErrUnauthorized
+	}
+
+	student, err := h.studentRepo.GetByUserID(c.Context(), userID)
+	if err != nil {
+		return helpers.ErrorResponse(c, fiber.StatusForbidden, "forbidden", "only students can create achievements")
+	}
+
+	var req models.CreateAchievementRequest
+	if err := c.BodyParser(&req); err != nil {
+		return helpers.ErrInvalidRequest
+	}
+	if req.Title == "" || req.AchievementType == "" {
+		return helpers.ErrorResponse(c, fiber.StatusUnprocessableEntity, "validation error", "title and type are required")
+	}
+
+	result, err := h.service.CreateAchievement(c.Context(), student.ID, &req)
+	if err != nil {
+		return helpers.ErrorResponse(c, fiber.StatusBadRequest, "failed to create achievement", err.Error())
+	}
+
+	return helpers.SuccessResponse(c, fiber.StatusCreated, "achievement created", result)
+}
+
+// Submit godoc
+// @Summary Submit achievement for verification
+// @Description Student submits their achievement for lecturer verification
+// @Tags Achievements
+// @Accept json
+// @Produce json
+// @Security BearerAuth
+// @Param id path string true "Achievement ID (UUID)"
+// @Success 200 {object} map[string]interface{} "Achievement submitted"
+// @Failure 403 {object} map[string]interface{} "Forbidden - not owner"
+// @Failure 400 {object} map[string]interface{} "Invalid state transition"
+// @Router /achievements/{id}/submit [post]
+func (h *AchievementHandler) Submit(c *fiber.Ctx) error {
+	id, err := helpers.GetUUIDFromParams(c, "id")
+	if err != nil {
+		return helpers.ErrInvalidRequest
+	}
+
+	userID, _ := helpers.GetUserIDFromLocals(c)
+
+	if err := h.service.ValidateOwnership(c.Context(), id, userID); err != nil {
+		return helpers.ErrorResponse(c, fiber.StatusForbidden, "forbidden", err.Error())
+	}
+
+	if err := h.service.SubmitForVerification(c.Context(), id); err != nil {
+		return helpers.ErrorResponse(c, fiber.StatusBadRequest, "submission failed", err.Error())
+	}
+
+	return helpers.SuccessResponseWithoutData(c, fiber.StatusOK, "achievement submitted")
+}
+
+// Verify godoc
+// @Summary Verify achievement
+// @Description Lecturer or admin approves an achievement
+// @Tags Achievements
+// @Accept json
+// @Produce json
+// @Security BearerAuth
+// @Param id path string true "Achievement ID (UUID)"
+// @Success 200 {object} map[string]interface{} "Achievement verified"
+// @Failure 400 {object} map[string]interface{} "Invalid state"
+// @Router /achievements/{id}/verify [post]
+func (h *AchievementHandler) Verify(c *fiber.Ctx) error {
+	id, err := helpers.GetUUIDFromParams(c, "id")
+	if err != nil {
+		return helpers.ErrInvalidRequest
+	}
+
+	verifierID, _ := helpers.GetUserIDFromLocals(c)
+
+	if err := h.service.VerifyAchievement(c.Context(), id, verifierID); err != nil {
+		return helpers.ErrorResponse(c, fiber.StatusBadRequest, "verification failed", err.Error())
+	}
+
+	return helpers.SuccessResponseWithoutData(c, fiber.StatusOK, "achievement verified")
+}
+
+// Reject godoc
+// @Summary Reject achievement
+// @Description Lecturer or admin rejects an achievement with a note
+// @Tags Achievements
+// @Accept json
+// @Produce json
+// @Security BearerAuth
+// @Param id path string true "Achievement ID (UUID)"
+// @Param rejection body object{note=string} true "Rejection note"
+// @Success 200 {object} map[string]interface{} "Achievement rejected"
+// @Failure 400 {object} map[string]interface{} "Invalid request"
+// @Router /achievements/{id}/reject [post]
+func (h *AchievementHandler) Reject(c *fiber.Ctx) error {
+	id, err := helpers.GetUUIDFromParams(c, "id")
+	if err != nil {
+		return helpers.ErrInvalidRequest
+	}
+
+	verifierID, _ := helpers.GetUserIDFromLocals(c)
+
+	var req struct {
+		Note string `json:"note"`
+	}
+	if err := c.BodyParser(&req); err != nil {
+		return helpers.ErrInvalidRequest
+	}
+	if req.Note == "" {
+		return helpers.ErrorResponse(c, fiber.StatusUnprocessableEntity, "validation error", "rejection note is required")
+	}
+
+	if err := h.service.RejectAchievement(c.Context(), id, verifierID, req.Note); err != nil {
+		return helpers.ErrorResponse(c, fiber.StatusBadRequest, "rejection failed", err.Error())
+	}
+
+	return helpers.SuccessResponseWithoutData(c, fiber.StatusOK, "achievement rejected")
+}
+
+// Delete godoc
+// @Summary Delete achievement
+// @Description Student deletes their own draft or rejected achievement
+// @Tags Achievements
+// @Accept json
+// @Produce json
+// @Security BearerAuth
+// @Param id path string true "Achievement ID (UUID)"
+// @Success 200 {object} map[string]interface{} "Achievement deleted"
+// @Failure 403 {object} map[string]interface{} "Forbidden"
+// @Router /achievements/{id} [delete]
+func (h *AchievementHandler) Delete(c *fiber.Ctx) error {
+	id, err := helpers.GetUUIDFromParams(c, "id")
+	if err != nil {
+		return helpers.ErrInvalidRequest
+	}
+
+	userID, _ := helpers.GetUserIDFromLocals(c)
+	student, err := h.studentRepo.GetByUserID(c.Context(), userID)
+	if err != nil {
+		return helpers.ErrorResponse(c, fiber.StatusForbidden, "forbidden", "user profile not found")
+	}
+
+	if err := h.service.DeleteAchievement(c.Context(), id, student.ID); err != nil {
+		return helpers.ErrorResponse(c, fiber.StatusBadRequest, "delete failed", err.Error())
+	}
+
+	return helpers.SuccessResponseWithoutData(c, fiber.StatusOK, "achievement deleted")
 }

@@ -1,225 +1,145 @@
 package routes
 
 import (
-	"context"
-	"sistem-prestasi-mhs/app/config"
-	"sistem-prestasi-mhs/app/helper"
+	"database/sql"
+
+	"github.com/gofiber/fiber/v2"
+	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo"
+
+	"sistem-prestasi-mhs/app/helpers"
 	"sistem-prestasi-mhs/app/middleware"
 	"sistem-prestasi-mhs/app/models"
 	"sistem-prestasi-mhs/app/repository"
-
-	"github.com/gofiber/fiber/v2"
-	"github.com/google/uuid"
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/bson/primitive"
+	"sistem-prestasi-mhs/app/service"
 )
 
-func ReportRoutes(r fiber.Router) {
-	studentRepo := repository.NewStudentRepository()
-	achievementRepo := repository.NewAchievementRepository()
+type ReportHandler struct {
+	achRepo *repository.AchievementRepository
+}
 
-	reports := r.Group("/reports")
+func NewReportHandler(ar *repository.AchievementRepository) *ReportHandler {
+	return &ReportHandler{achRepo: ar}
+}
 
-	// Pastikan middleware sudah disesuaikan untuk Fiber
-	reports.Use(middleware.AuthMiddleware())
+// ============================================================================
+// ROUTE SETUP
+// ============================================================================
 
-	{
-		// @Summary Get Achievement Statistics
-		// @Description Get statistics of achievements based on user role
-		// @Tags Reports
-		// @Produce json
-		// @Security BearerAuth
-		// @Success 200 {object} object{status=string,data=object}
-		// @Failure 401 {object} object{status=string,message=string}
-		// @Router /reports/statistics [get]
-		reports.Get("/statistics", func(c *fiber.Ctx) error {
-			// Mengambil data dari Middleware (c.Locals)
-			// Kita perlu melakukan type assertion .(string) karena Locals mengembalikan interface{}
-			userIDStr, _ := c.Locals("user_id").(string)
-			userID := helper.ParseUUID(userIDStr)
-			role, _ := c.Locals("role").(string)
+func SetupReportRoutes(router fiber.Router, db *sql.DB, mongoDB *mongo.Database) {
+	// Initialize Dependencies
+	userRepo := repository.NewUserRepository(db)
+	achRepo := repository.NewAchievementRepository(db, mongoDB)
 
-			var filter bson.M
-			switch role {
-			case "Mahasiswa":
-				student, err := studentRepo.FindByUserID(userID)
-				if err != nil {
-					return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
-						"status":  "error",
-						"message": "Student record not found",
-					})
-				}
-				filter = bson.M{"studentId": student.ID.String()}
+	authService := service.NewAuthService(userRepo)
+	handler := NewReportHandler(achRepo)
 
-			case "Dosen Wali":
-				lecturer, err := studentRepo.FindLecturerByUserID(userID)
-				if err != nil {
-					return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
-						"status":  "error",
-						"message": "Lecturer record not found",
-					})
-				}
-				students, _ := studentRepo.FindByAdvisorID(lecturer.ID)
-				studentIDs := []string{}
-				for _, s := range students {
-					studentIDs = append(studentIDs, s.ID.String())
-				}
-				filter = bson.M{"studentId": bson.M{"$in": studentIDs}}
+	// Apply Auth Middleware
+	router.Use(middleware.AuthMiddleware(authService))
 
-			case "Admin":
-				filter = bson.M{}
+	// Routes
+	router.Get("/statistics", handler.GetSystemStatistics)
+	router.Get("/student/:id", handler.GetStudentReport)
+}
 
-			default:
-				return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
-					"status":  "error",
-					"message": "Unauthorized role",
-				})
-			}
+// ============================================================================
+// HANDLER METHODS
+// ============================================================================
 
-			// Get statistics from MongoDB
-			collection := config.MongoDatabase.Collection("achievements")
+// GetSystemStatistics aggregates achievement data to show dashboard statistics
+// @Summary Get System Statistics
+// @Description Get aggregated statistics of achievements including counts by type and status. Returns a snapshot of recent data (limited to 100 items for performance).
+// @Tags Reports
+// @Accept json
+// @Produce json
+// @Security BearerAuth
+// @Success 200 {object} object{status=string,message=string,data=object{sample_size=int,by_achievement_type=object,by_status=object}} "Successfully retrieved system statistics"
+// @Failure 401 {object} object{status=string,message=string,error=string} "Unauthorized - Invalid or missing token"
+// @Failure 403 {object} object{status=string,message=string,error=string} "Forbidden - Insufficient permissions"
+// @Failure 500 {object} object{status=string,message=string,error=string} "Internal server error"
+// @Router /reports/statistics [get]
+func (h *ReportHandler) GetSystemStatistics(c *fiber.Ctx) error {
+	limit := 100 // Hard limit for analysis snapshot
+	offset := 0
 
-			// Total achievements
-			totalAchievements, _ := collection.CountDocuments(context.Background(), filter)
+	// 1. Fetch recent references
+	refs, err := h.achRepo.ListAll(c.Context(), limit, offset)
+	if err != nil {
+		return helpers.ErrorResponse(c, fiber.StatusInternalServerError, "failed to retrieve data", err.Error())
+	}
 
-			// Achievements by type
-			pipeline := []bson.M{
-				{"$match": filter},
-				{"$group": bson.M{
-					"_id":   "$achievementType",
-					"count": bson.M{"$sum": 1},
-				}},
-			}
-			cursor, _ := collection.Aggregate(context.Background(), pipeline)
-			var typeStats []bson.M
-			cursor.All(context.Background(), &typeStats)
+	// 2. Aggregate Data
+	stats := h.aggregateStats(c, refs)
 
-			// Achievements by competition level
-			competitionPipeline := []bson.M{
-				{"$match": bson.M{
-					"$and": []bson.M{
-						filter,
-						{"achievementType": "competition"},
-					},
-				}},
-				{"$group": bson.M{
-					"_id":   "$details.competitionLevel",
-					"count": bson.M{"$sum": 1},
-				}},
-			}
-			compCursor, _ := collection.Aggregate(context.Background(), competitionPipeline)
-			var competitionStats []bson.M
-			compCursor.All(context.Background(), &competitionStats)
+	return helpers.SuccessResponse(c, fiber.StatusOK, "statistics retrieved", stats)
+}
 
-			// Get status statistics from PostgreSQL
-			var statusStats []struct {
-				Status string
-				Count  int64
-			}
+// GetStudentReport retrieves detailed achievement report for a specific student
+// @Summary Get Student Achievement Report
+// @Description Get comprehensive report of achievements for a specific student including all their achievement records with pagination support
+// @Tags Reports
+// @Accept json
+// @Produce json
+// @Security BearerAuth
+// @Param id path string true "Student UUID" format(uuid) example(770e8400-e29b-41d4-a716-446655440002)
+// @Param page query int false "Page number for pagination" default(1) minimum(1)
+// @Param limit query int false "Number of items per page" default(10) minimum(1) maximum(100)
+// @Success 200 {object} object{status=string,message=string,data=object{total_shown=int,achievements=[]object}} "Successfully retrieved student report"
+// @Failure 400 {object} object{status=string,message=string,error=string} "Bad Request - Invalid student ID format"
+// @Failure 401 {object} object{status=string,message=string,error=string} "Unauthorized - Invalid or missing token"
+// @Failure 403 {object} object{status=string,message=string,error=string} "Forbidden - Cannot access other student's report"
+// @Failure 404 {object} object{status=string,message=string,error=string} "Student not found"
+// @Failure 500 {object} object{status=string,message=string,error=string} "Internal server error"
+// @Router /reports/student/{id} [get]
+func (h *ReportHandler) GetStudentReport(c *fiber.Ctx) error {
+	studentID, err := helpers.GetUUIDFromParams(c, "id")
+	if err != nil {
+		return helpers.ErrInvalidRequest
+	}
 
-			query := config.DB.Model(&models.AchievementReference{}).
-				Select("status, count(*) as count").
-				Group("status")
+	limit, offset := helpers.GetPaginationParams(c)
 
-			switch role {
-			case "Mahasiswa":
-				student, _ := studentRepo.FindByUserID(userID)
-				query = query.Where("student_id = ?", student.ID)
-			case "Dosen Wali":
-				lecturer, _ := studentRepo.FindLecturerByUserID(userID)
-				students, _ := studentRepo.FindByAdvisorID(lecturer.ID)
-				studentIDs := []uuid.UUID{}
-				for _, s := range students {
-					studentIDs = append(studentIDs, s.ID)
-				}
-				query = query.Where("student_id IN ?", studentIDs)
-			}
+	data, err := h.achRepo.GetStudentAchievements(c.Context(), studentID, limit, offset)
+	if err != nil {
+		return helpers.ErrorResponse(c, fiber.StatusInternalServerError, "failed to retrieve report", err.Error())
+	}
 
-			query.Scan(&statusStats)
+	return helpers.SuccessResponse(c, fiber.StatusOK, "student report retrieved", fiber.Map{
+		"total_shown":  len(data),
+		"achievements": data,
+	})
+}
 
-			return c.Status(fiber.StatusOK).JSON(fiber.Map{
-				"status": "success",
-				"data": fiber.Map{
-					"total_achievements":   totalAchievements,
-					"by_type":              typeStats,
-					"by_competition_level": competitionStats,
-					"by_status":            statusStats,
-				},
-			})
-		})
+// ============================================================================
+// INTERNAL HELPERS
+// ============================================================================
 
-		// @Summary Get Student Report
-		// @Description Get detailed achievement report for specific student
-		// @Tags Reports
-		// @Produce json
-		// @Security BearerAuth
-		// @Param id path string true "Student ID"
-		// @Success 200 {object} object{status=string,data=object}
-		// @Failure 404 {object} object{status=string,message=string}
-		// @Router /reports/student/{id} [get]
-		reports.Get("/student/:id", func(c *fiber.Ctx) error {
-			id, err := uuid.Parse(c.Params("id"))
-			if err != nil {
-				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-					"status":  "error",
-					"message": "Invalid ID format",
-				})
-			}
+// aggregateStats processes achievement references and returns aggregated statistics
+func (h *ReportHandler) aggregateStats(c *fiber.Ctx, refs []*models.AchievementReference) fiber.Map {
+	typeCount := make(map[string]int)
+	statusCount := make(map[string]int)
 
-			// Get student info
-			student, err := studentRepo.FindByID(id)
-			if err != nil {
-				return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
-					"status":  "error",
-					"message": "Student not found",
-				})
-			}
+	// Process aggregation
+	for _, ref := range refs {
+		// Count Status
+		statusCount[ref.Status]++
 
-			// Get achievements
-			// Note: Limit diset tinggi (1000) untuk laporan
-			refs, total, _ := achievementRepo.FindReferencesByStudentID(id, 1000, 0)
+		// Convert string Hex ID to primitive.ObjectID
+		objID, err := primitive.ObjectIDFromHex(ref.MongoAchievementID)
+		if err != nil {
+			// Skip if MongoDB ID is invalid/corrupted
+			continue
+		}
 
-			// Calculate statistics
-			var verified, submitted, draft, rejected int64
-			var totalPoints float64
+		// Count Type (Requires fetching detail from MongoDB)
+		if detail, err := h.achRepo.GetAchievementByID(c.Context(), objID); err == nil && detail != nil {
+			typeCount[detail.AchievementType]++
+		}
+	}
 
-			collection := config.MongoDatabase.Collection("achievements")
-			for _, ref := range refs {
-				switch ref.Status {
-				case models.AchievementStatusVerified:
-					verified++
-				case models.AchievementStatusSubmitted:
-					submitted++
-				case models.AchievementStatusDraft:
-					draft++
-				case models.AchievementStatusRejected:
-					rejected++
-				}
-
-				// Get points from MongoDB
-				var achievement models.Achievement
-				objID, err := primitive.ObjectIDFromHex(ref.MongoAchievementID)
-				if err == nil {
-					collection.FindOne(context.Background(), bson.M{"_id": objID}).Decode(&achievement)
-					totalPoints += achievement.Points
-				}
-			}
-
-			return c.Status(fiber.StatusOK).JSON(fiber.Map{
-				"status": "success",
-				"data": fiber.Map{
-					"student": student,
-					"summary": fiber.Map{
-						"total_achievements": total,
-						"verified":           verified,
-						"submitted":          submitted,
-						"draft":              draft,
-						"rejected":           rejected,
-						"total_points":       totalPoints,
-					},
-					"achievements": refs,
-				},
-			})
-		})
+	return fiber.Map{
+		"sample_size":         len(refs),
+		"by_achievement_type": typeCount,
+		"by_status":           statusCount,
 	}
 }
